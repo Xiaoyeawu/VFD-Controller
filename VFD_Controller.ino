@@ -79,6 +79,11 @@ bool          bootCheckDone   = false; // one-shot ~10 s post-connect version ch
 unsigned long lastOTACheck = 0;
 const unsigned long OTA_CHECK_INTERVAL = 3600000UL;   // 1 hour
 
+// Status-LED modes. Declared up here (before the first function) so the
+// Arduino IDE's auto-generated prototypes can see the type -- otherwise
+// the prototype for setLED(LedMode) lands above this declaration and fails.
+enum LedMode { LED_M_OFF, LED_M_SOLID, LED_M_SLOW, LED_M_MEDIUM, LED_M_FAST, LED_M_STROBE };
+
 // =====================================================================
 //  SPEED MAPPING  -- single source of truth
 //    brightness 0..254  ->  percent 0..100  ->  Hz 0..50  ->  RPM 0..1500
@@ -93,9 +98,8 @@ void computeSpeed(uint8_t brightness, int &percent, float &hz, int &rpm) {
 // =====================================================================
 //  STATUS LED  -- non-blocking, millis-based multi-mode helper
 //  (pattern adapted from the Tropika reference sketch's setLED())
+//  (LedMode enum is declared earlier, before the first function.)
 // =====================================================================
-enum LedMode { LED_M_OFF, LED_M_SOLID, LED_M_SLOW, LED_M_MEDIUM, LED_M_FAST, LED_M_STROBE };
-
 void setLED(LedMode mode) {
   switch (mode) {
     case LED_M_OFF:   digitalWrite(LED_PIN, LED_OFF); return;
