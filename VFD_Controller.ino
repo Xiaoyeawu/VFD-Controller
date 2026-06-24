@@ -30,7 +30,7 @@
 //  Bump currentVersion before every release, then upload the matching
 //  firmware.bin + an updated version.txt to the repo's main branch.
 // ---------------------------------------------------------------------
-String currentVersion = "1.0.0.2";   // <-- bump on each new release
+String currentVersion = "1.0.0.3";   // <-- bump on each new release
 
 const char* VERSION_URL = "https://raw.githubusercontent.com/Xiaoyeawu/VFD-Controller/main/version.txt";
 const char* OTA_URL     = "https://raw.githubusercontent.com/Xiaoyeawu/VFD-Controller/main/firmware.bin";
@@ -226,8 +226,11 @@ bool checkVersion() {
     Serial.println("[OTA] version check begin() failed");
   }
 
-  UpdateAvailable.setContact(newer);             // detected = update available
-  Serial.println(newer ? "[OTA] UPDATE AVAILABLE" : "[OTA] firmware up to date");
+  // Inverted on purpose: update available -> OPEN, up to date -> CLOSED.
+  // (Contact "detected"/true reads as Closed, so pass !newer.)
+  UpdateAvailable.setContact(!newer);
+  Serial.println(newer ? "[OTA] UPDATE AVAILABLE (sensor OPEN)"
+                       : "[OTA] firmware up to date (sensor CLOSED)");
   return newer;
 }
 
@@ -398,7 +401,8 @@ void setup() {
   // ---- Matter endpoints ----------------------------------------------
   VFDMotor.begin();                       // dimmable light  : VFD Motor
   FirmwareUpdatePlug.begin(false);        // on/off plug     : Firmware Update
-  UpdateAvailable.begin(false);           // contact sensor  : Update Available
+  UpdateAvailable.begin(true);            // contact sensor  : Update Available
+                                          // start CLOSED (= up to date) until first check
 
   // Endpoint 1: VFD Motor  -- run/stop
   VFDMotor.onChangeOnOff([](bool on) -> bool {
