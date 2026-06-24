@@ -1,0 +1,9 @@
+# Arduino build artifacts (we publish firmware.bin manually for OTA)
+build/
+*.elf
+*.map
+*.hex
+*.d.bin
+*.bootloader.bin
+*.partitions.bin
+*.merged.bin
