@@ -30,7 +30,7 @@
 //  Bump currentVersion before every release, then upload the matching
 //  firmware.bin + an updated version.txt to the repo's main branch.
 // ---------------------------------------------------------------------
-String currentVersion = "1.0.0.1";   // <-- bump on each new release
+String currentVersion = "1.0.0.2";   // <-- bump on each new release
 
 const char* VERSION_URL = "https://raw.githubusercontent.com/Xiaoyeawu/VFD-Controller/main/version.txt";
 const char* OTA_URL     = "https://raw.githubusercontent.com/Xiaoyeawu/VFD-Controller/main/firmware.bin";
@@ -51,9 +51,31 @@ const char* OTA_URL     = "https://raw.githubusercontent.com/Xiaoyeawu/VFD-Contr
 #define RS485_DE_PIN  20      // D10 -> MAX485 DE + RE (tied together)
 
 // ---------------------------------------------------------------------
-//  PHASE 2 SWITCH  (keep 0 for Phase 1 so it compiles clean)
+//  PHASE 2 SWITCH
+//    0 = Matter only (no RS485 traffic) -- safe default, ships like this
+//    1 = also drive the real VFD over RS485 Modbus RTU (wire MAX485 first)
 // ---------------------------------------------------------------------
 #define PHASE2 0
+
+// ---------------------------------------------------------------------
+//  PHASE 2: VFD Modbus settings  --  VERIFY AGAINST YOUR VFD MANUAL
+//  Drive: ZESTABLE ZA280A-1.5G3 (Jinqu Electric). No public datasheet was
+//  found, so these use the convention used by the large majority of generic
+//  Chinese VFDs. Confirm on the bench (watch the VFD keypad) before trusting
+//  them with a spinning motor.
+//
+//    Frequency setpoint (0x1000): signed -10000..10000 = -100.00%..100.00%
+//      of the VFD's configured MAX frequency. So value = hz / VFD_MAX_HZ * 10000.
+//    Command (0x2000): 1=fwd run, 2=rev, 3=fwd jog, 4=rev jog,
+//      5=decel stop, 6=coast stop, 7=fault reset.
+// ---------------------------------------------------------------------
+#define VFD_SLAVE_ADDR   1        // RS485 station address (set on the VFD's comm param)
+#define VFD_BAUD         9600     // 9600 8N1
+#define VFD_REG_FREQ     0x1000   // frequency setpoint register (percent of max)
+#define VFD_REG_CMD      0x2000   // run/stop command register
+#define VFD_CMD_RUN_FWD  0x0001   // forward run
+#define VFD_CMD_STOP     0x0005   // decelerate to stop
+#define VFD_MAX_HZ       50.0f    // MUST equal the VFD's configured max frequency
 
 // ---------------------------------------------------------------------
 //  MATTER ENDPOINTS  (one node, three endpoints)
@@ -72,6 +94,13 @@ volatile bool otaRequested  = false;   // set by the Firmware Update plug callba
 bool          otaInProgress = false;   // true while flashing (drives LED strobe)
 bool          buttonHeld    = false;   // true while BOOT button is being held
 bool          wasConnected  = false;   // have we ever reached WL_CONNECTED?
+
+// VFD target state. The Matter callbacks just update these (fast, non-blocking);
+// the actual RS485 write happens throttled in loop() so dragging the speed
+// slider can't flood the Modbus bus.
+volatile bool  g_motorOn  = false;
+volatile float g_targetHz = 0.0f;
+volatile bool  g_vfdDirty = true;      // a change is pending push to the VFD
 
 unsigned long wifiConnectedAt = 0;     // millis() when WiFi first came up
 bool          bootCheckDone   = false; // one-shot ~10 s post-connect version check
@@ -270,18 +299,69 @@ void doOTAUpdate() {
 //  manual in Phase 2). Do NOT implement the writes yet.
 // =====================================================================
 #if PHASE2
+// Standard Modbus RTU CRC-16 (poly 0xA001). Returned low-byte-first on the wire.
+static uint16_t modbusCRC(const uint8_t *buf, uint8_t len) {
+  uint16_t crc = 0xFFFF;
+  for (uint8_t i = 0; i < len; i++) {
+    crc ^= buf[i];
+    for (uint8_t b = 0; b < 8; b++) {
+      if (crc & 0x0001) { crc >>= 1; crc ^= 0xA001; }
+      else                crc >>= 1;
+    }
+  }
+  return crc;
+}
+
+// Modbus function 0x06 -- write single holding register. Best-effort read of
+// the echo response (0x06 echoes the request frame). Returns true if any
+// response arrived.
+bool vfdWriteReg(uint16_t reg, uint16_t value) {
+  uint8_t f[8];
+  f[0] = VFD_SLAVE_ADDR;
+  f[1] = 0x06;
+  f[2] = reg   >> 8;  f[3] = reg   & 0xFF;
+  f[4] = value >> 8;  f[5] = value & 0xFF;
+  uint16_t crc = modbusCRC(f, 6);
+  f[6] = crc & 0xFF;  f[7] = crc >> 8;     // CRC low byte first
+
+  digitalWrite(RS485_DE_PIN, HIGH);        // enable driver -> transmit
+  delayMicroseconds(50);
+  Serial1.write(f, 8);
+  Serial1.flush();                         // block until the last byte is shifted out
+  delayMicroseconds(100);                  // let the stop bit clear the line
+  digitalWrite(RS485_DE_PIN, LOW);         // back to receive
+
+  Serial.printf("[VFD] TX fc06 reg=0x%04X val=%u\n", reg, value);
+
+  unsigned long t0 = millis();
+  uint8_t n = 0, resp[8];
+  while (millis() - t0 < 100 && n < sizeof(resp)) {
+    if (Serial1.available()) resp[n++] = (uint8_t)Serial1.read();
+  }
+  if (n == 0) {
+    Serial.println("[VFD] no response (check wiring / slave addr / baud / VFD power)");
+    return false;
+  }
+  return true;
+}
+
 void vfdInit() {
-  // Serial1.begin(9600, SERIAL_8N1, RS485_RO_PIN, RS485_DI_PIN);
-  // pinMode(RS485_DE_PIN, OUTPUT);
-  // digitalWrite(RS485_DE_PIN, LOW);   // receive mode by default
+  Serial1.begin(VFD_BAUD, SERIAL_8N1, RS485_RO_PIN, RS485_DI_PIN);
+  pinMode(RS485_DE_PIN, OUTPUT);
+  digitalWrite(RS485_DE_PIN, LOW);         // receive mode by default
+  Serial.printf("[VFD] Modbus RTU ready on Serial1 (%d 8N1), slave %d\n",
+                VFD_BAUD, VFD_SLAVE_ADDR);
 }
 
 void vfdWriteFrequency(float hz) {
-  // map hz -> VFD frequency register, send a Modbus "write single register"
+  if (hz < 0)          hz = 0;
+  if (hz > VFD_MAX_HZ) hz = VFD_MAX_HZ;
+  uint16_t val = (uint16_t)lroundf(hz / VFD_MAX_HZ * 10000.0f);  // 0..10000 = 0..100%
+  vfdWriteReg(VFD_REG_FREQ, val);
 }
 
 void vfdRun(bool on) {
-  // send the Modbus run/stop coil
+  vfdWriteReg(VFD_REG_CMD, on ? VFD_CMD_RUN_FWD : VFD_CMD_STOP);
 }
 #endif
 
@@ -323,9 +403,8 @@ void setup() {
   // Endpoint 1: VFD Motor  -- run/stop
   VFDMotor.onChangeOnOff([](bool on) -> bool {
     Serial.println(on ? ">> MOTOR RUN" : ">> MOTOR STOP");
-#if PHASE2
-    vfdRun(on);
-#endif
+    g_motorOn  = on;
+    g_vfdDirty = true;        // pushed to the VFD in loop() (Phase 2)
     return true;
   });
 
@@ -334,9 +413,8 @@ void setup() {
     int percent, rpm; float hz;
     computeSpeed(brightness, percent, hz, rpm);
     Serial.printf(">> SPEED: %d%%  ->  %.1f Hz  ->  %d RPM\n", percent, hz, rpm);
-#if PHASE2
-    vfdWriteFrequency(hz);
-#endif
+    g_targetHz = hz;
+    g_vfdDirty = true;        // pushed to the VFD in loop() (Phase 2)
     return true;
   });
 
@@ -390,6 +468,19 @@ void loop() {
                   netUp() ? 1 : 0,
                   WiFi.localIP().toString().c_str());
   }
+
+  // 1c) Phase 2: push the latest run/speed to the real VFD, throttled to
+  //     10 Hz so dragging the slider can't flood the RS485 bus. Disabled
+  //     (compiled out) until PHASE2 is set to 1 and the MAX485 is wired.
+#if PHASE2
+  static unsigned long lastVfdPush = 0;
+  if (g_vfdDirty && (millis() - lastVfdPush > 100)) {
+    lastVfdPush = millis();
+    g_vfdDirty  = false;
+    vfdRun(g_motorOn);
+    vfdWriteFrequency(g_motorOn ? g_targetHz : 0.0f);
+  }
+#endif
 
   // 2) Track WiFi connection for the boot-time version check
   if (netUp()) {
