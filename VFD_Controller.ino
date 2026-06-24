@@ -118,10 +118,11 @@ void setLED(LedMode mode) {
 }
 
 bool netUp() {
-  // After BLE commissioning the CHIP stack owns the WiFi connection;
-  // Matter.isWiFiConnected() is the authoritative check, WiFi.status()
-  // is the Arduino-side mirror. Accept either.
-  return (WiFi.status() == WL_CONNECTED) || Matter.isWiFiConnected();
+  // "Up" means associated AND holding a real DHCP IP. Checking only
+  // WiFi.status() / Matter.isWiFiConnected() can momentarily report
+  // "connected" with a 0.0.0.0 address, which made the boot OTA check
+  // fire too early and fail with HTTP -1. Require a valid IP.
+  return (WiFi.status() == WL_CONNECTED) && ((uint32_t)WiFi.localIP() != 0);
 }
 
 void updateStatusLED() {
@@ -376,6 +377,16 @@ void loop() {
   // 1) Status LED + factory-reset button (both non-blocking)
   handleFactoryReset();
   updateStatusLED();
+
+  // 1b) Throttled status heartbeat (every 5 s) so on-board state is visible
+  static unsigned long lastBeat = 0;
+  if (millis() - lastBeat > 5000) {
+    lastBeat = millis();
+    Serial.printf("[status] commissioned=%d  wifi=%d  ip=%s\n",
+                  Matter.isDeviceCommissioned() ? 1 : 0,
+                  netUp() ? 1 : 0,
+                  WiFi.localIP().toString().c_str());
+  }
 
   // 2) Track WiFi connection for the boot-time version check
   if (netUp()) {
