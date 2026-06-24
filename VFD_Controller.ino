@@ -118,11 +118,12 @@ void setLED(LedMode mode) {
 }
 
 bool netUp() {
-  // "Up" means associated AND holding a real DHCP IP. Checking only
-  // WiFi.status() / Matter.isWiFiConnected() can momentarily report
-  // "connected" with a 0.0.0.0 address, which made the boot OTA check
-  // fire too early and fail with HTTP -1. Require a valid IP.
-  return (WiFi.status() == WL_CONNECTED) && ((uint32_t)WiFi.localIP() != 0);
+  // IMPORTANT: under Matter BLE commissioning the CHIP stack (not the Arduino
+  // WiFi object) brings up and owns the WiFi connection. As a result
+  // WiFi.status() reads disconnected and WiFi.localIP() reads 0.0.0.0 even
+  // when the device is fully online (HomeKit/Aqara can control it over IP).
+  // Matter's own connectivity flag is the authoritative "online" signal.
+  return Matter.isWiFiConnected();
 }
 
 void updateStatusLED() {
@@ -382,7 +383,9 @@ void loop() {
   static unsigned long lastBeat = 0;
   if (millis() - lastBeat > 5000) {
     lastBeat = millis();
-    Serial.printf("[status] commissioned=%d  wifi=%d  ip=%s\n",
+    // online = Matter's authoritative WiFi flag. arduino_ip usually reads
+    // 0.0.0.0 under Matter-managed WiFi -- that's expected, not a fault.
+    Serial.printf("[status] commissioned=%d  online=%d  arduino_ip=%s\n",
                   Matter.isDeviceCommissioned() ? 1 : 0,
                   netUp() ? 1 : 0,
                   WiFi.localIP().toString().c_str());
@@ -392,7 +395,7 @@ void loop() {
   if (netUp()) {
     if (wifiConnectedAt == 0) {
       wifiConnectedAt = millis();
-      Serial.println("[WiFi] connected: " + WiFi.localIP().toString());
+      Serial.println("[net] Matter WiFi connected (online)");
     }
   } else {
     wifiConnectedAt = 0;
